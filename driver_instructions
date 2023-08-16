@@ -1,0 +1,12 @@
+Orange Pi (ubuntu)
+1. Clone rockchip linux: git clone --depth=1 https://github.com/Joshua-Riek/linux-rockchip/tree/linux-gen-rkr4
+2. Cd into linux
+3. Create orangepi-5-plus-{camera}.dts file and rk3588-{camera-module}-c1, -c2, and -c3 .dts files and copy into ../arch/arm64/boot/dts/rockchip/overlay/
+4. Add sensor info to rk3588s-orangepi-5-camera1, camera2, and camera3 .dtsi files found in ../arch/arm64/boot/dts/rockchip
+5. Add configs to makefile in /boot/dts/rockchip
+6. Run: make menuconfig
+7. Build the drivers: make dtbs
+8. Copy the orangepi-5-{camera-module}-c1, -c2, and -c3 .dtbo files into boot/firmware/dtbs/overlays
+9. Copy the orangepi-5-{camera-module}-c1, -c2, and -c3 .dtbo files into usr/lib/linux-image-{kernel-version}-rockchip-rk3588/rockchip/overlay (maybe??)
+10. Copy the rk3588s-orangepi-5.dtb, rk3588s-orangepi-5b.dtb, and rk3588-orangepi-5-plus.dtb from ../arch/arm64/boot/dts/rockchip/ to /boot/dtbs/rockchip (or equivalent naming convention on another OS)
+11. Add overlay to ubuntuEnv.txt found in /boot/firmware like so: overlays=orangepi-5-{camera-module}-{port}
