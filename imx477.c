@@ -20,6 +20,8 @@
 #include <media/v4l2-event.h>
 #include <media/v4l2-fwnode.h>
 #include <media/v4l2-mediabus.h>
+#include <linux/rk-camera-module.h>
+#include <linux/rk-preisp.h>
 
 static int dpc_enable = 1;
 module_param(dpc_enable, int, 0644);
@@ -35,7 +37,6 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 /* Chip ID */
 #define IMX477_REG_CHIP_ID		0x0016
 #define IMX477_CHIP_ID			0x0477
-#define IMX378_CHIP_ID			0x0378
 
 #define IMX477_REG_MODE_SELECT		0x0100
 #define IMX477_MODE_STANDBY		0x00
@@ -54,10 +55,6 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 #define IMX477_REG_FRAME_LENGTH		0x0340
 #define IMX477_FRAME_LENGTH_MAX		0xffdc
 
-/* H_TIMING internal */
-#define IMX477_REG_LINE_LENGTH		0x0342
-#define IMX477_LINE_LENGTH_MAX		0xfff0
-
 /* Long exposure multiplier */
 #define IMX477_LONG_EXP_SHIFT_MAX	7
 #define IMX477_LONG_EXP_SHIFT_REG	0x3100
@@ -65,18 +62,22 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 /* Exposure control */
 #define IMX477_REG_EXPOSURE		0x0202
 #define IMX477_EXPOSURE_OFFSET		22
-#define IMX477_EXPOSURE_MIN		4
+#define IMX477_EXPOSURE_MIN		20
 #define IMX477_EXPOSURE_STEP		1
 #define IMX477_EXPOSURE_DEFAULT		0x640
 #define IMX477_EXPOSURE_MAX		(IMX477_FRAME_LENGTH_MAX - \
 					 IMX477_EXPOSURE_OFFSET)
 
+/* global gain control */
+#define IMX477_GAIN_MAX			0x1600
+#define IMX477_GAIN_STEP		0x10
+#define IMX477_AGAIN_LIMIT		0x160
+
 /* Analog gain control */
 #define IMX477_REG_ANALOG_GAIN		0x0204
-#define IMX477_ANA_GAIN_MIN		0
+#define IMX477_ANA_GAIN_MIN		0x10
 #define IMX477_ANA_GAIN_MAX		978
-#define IMX477_ANA_GAIN_STEP		1
-#define IMX477_ANA_GAIN_DEFAULT		0x0
+#define IMX477_ANA_GAIN_DEFAULT		0x20
 
 /* Digital gain control */
 #define IMX477_REG_DIGITAL_GAIN		0x020e
@@ -118,7 +119,7 @@ MODULE_PARM_DESC(trigger_mode, "Set vsync trigger mode: 1=source, 2=sink");
 
 enum pad_types {
 	IMAGE_PAD,
-	METADATA_PAD,
+	//METADATA_PAD,
 	NUM_PADS
 };
 
@@ -129,6 +130,10 @@ enum pad_types {
 #define IMX477_PIXEL_ARRAY_TOP		16U
 #define IMX477_PIXEL_ARRAY_WIDTH	4056U
 #define IMX477_PIXEL_ARRAY_HEIGHT	3040U
+
+#define IMX477_NAME					"imx477"
+
+#define MEDIA_BUS_FMT_SENSOR_DATA	0x7002
 
 struct imx477_reg {
 	u16 address;
@@ -167,7 +172,6 @@ struct imx477_mode {
 static const struct imx477_reg mode_common_regs[] = {
 	{0x0136, 0x18},
 	{0x0137, 0x00},
-	{0x0138, 0x01},
 	{0xe000, 0x00},
 	{0xe07a, 0x01},
 	{0x0808, 0x02},
@@ -921,7 +925,7 @@ static const struct imx477_reg mode_1332x990_regs[] = {
 };
 
 /* Mode configs */
-static const struct imx477_mode supported_modes_12bit[] = {
+static const struct imx477_mode supported_modes[] = {
 	{
 		/* 12MPix 10fps mode */
 		.width = 4056,
@@ -996,40 +1000,6 @@ static const struct imx477_mode supported_modes_12bit[] = {
 	}
 };
 
-static const struct imx477_mode supported_modes_10bit[] = {
-	{
-		/* 120fps. 2x2 binned and cropped */
-		.width = 1332,
-		.height = 990,
-		.line_length_pix = 6664,
-		.crop = {
-			/*
-			 * FIXME: the analog crop rectangle is actually
-			 * programmed with a horizontal displacement of 0
-			 * pixels, not 4. It gets shrunk after going through
-			 * the scaler. Move this information to the compose
-			 * rectangle once the driver is expanded to represent
-			 * its processing blocks with multiple subdevs.
-			 */
-			.left = IMX477_PIXEL_ARRAY_LEFT + 696,
-			.top = IMX477_PIXEL_ARRAY_TOP + 528,
-			.width = 2664,
-			.height = 1980,
-		},
-		.timeperframe_min = {
-			.numerator = 100,
-			.denominator = 12000
-		},
-		.timeperframe_default = {
-			.numerator = 100,
-			.denominator = 12000
-		},
-		.reg_list = {
-			.num_of_regs = ARRAY_SIZE(mode_1332x990_regs),
-			.regs = mode_1332x990_regs,
-		}
-	}
-};
 
 /*
  * The supported formats.
@@ -1104,7 +1074,9 @@ struct imx477 {
 	struct clk *xclk;
 	u32 xclk_freq;
 
-	struct gpio_desc *reset_gpio;
+	struct gpio_desc *power_gpio;
+	struct gpio_desc *gpo_gpio;
+	
 	struct regulator_bulk_data supplies[IMX477_NUM_SUPPLIES];
 
 	struct v4l2_ctrl_handler ctrl_handler;
@@ -1116,6 +1088,8 @@ struct imx477 {
 	struct v4l2_ctrl *vblank;
 	struct v4l2_ctrl *hblank;
 
+	struct v4l2_ctrl *link_freq;
+
 	/* Current mode */
 	const struct imx477_mode *mode;
 
@@ -1124,6 +1098,9 @@ struct imx477 {
 	 * Protect sensor module set pad format and start/stop streaming safely.
 	 */
 	struct mutex mutex;
+
+	/* Streaming on/off */
+	bool power_on;
 
 	/* Streaming on/off */
 	bool streaming;
@@ -1153,16 +1130,8 @@ static inline void get_mode_table(unsigned int code,
 	case MEDIA_BUS_FMT_SGRBG12_1X12:
 	case MEDIA_BUS_FMT_SGBRG12_1X12:
 	case MEDIA_BUS_FMT_SBGGR12_1X12:
-		*mode_list = supported_modes_12bit;
-		*num_modes = ARRAY_SIZE(supported_modes_12bit);
-		break;
-	/* 10-bit */
-	case MEDIA_BUS_FMT_SRGGB10_1X10:
-	case MEDIA_BUS_FMT_SGRBG10_1X10:
-	case MEDIA_BUS_FMT_SGBRG10_1X10:
-	case MEDIA_BUS_FMT_SBGGR10_1X10:
-		*mode_list = supported_modes_10bit;
-		*num_modes = ARRAY_SIZE(supported_modes_10bit);
+		*mode_list = supported_modes;
+		*num_modes = ARRAY_SIZE(supported_modes);
 		break;
 	default:
 		*mode_list = NULL;
@@ -1227,6 +1196,7 @@ static int imx477_write_regs(struct imx477 *imx477,
 	struct i2c_client *client = v4l2_get_subdevdata(&imx477->sd);
 	unsigned int i;
 	int ret;
+	printk(KERN_INFO "imx477: imx477_write_regs\n");
 
 	for (i = 0; i < len; i++) {
 		ret = imx477_write_reg(imx477, regs[i].address, 1, regs[i].val);
@@ -1246,6 +1216,7 @@ static int imx477_write_regs(struct imx477 *imx477,
 static u32 imx477_get_format_code(struct imx477 *imx477, u32 code)
 {
 	unsigned int i;
+	printk(KERN_INFO "imx477: imx477_get_format_code\n");
 
 	lockdep_assert_held(&imx477->mutex);
 
@@ -1264,8 +1235,9 @@ static u32 imx477_get_format_code(struct imx477 *imx477, u32 code)
 
 static void imx477_set_default_format(struct imx477 *imx477)
 {
+	printk(KERN_INFO "imx477: imx477_set_default_format\n");
 	/* Set default mode to max resolution */
-	imx477->mode = &supported_modes_12bit[0];
+	imx477->mode = &supported_modes[0];
 	imx477->fmt_code = MEDIA_BUS_FMT_SRGGB12_1X12;
 }
 
@@ -1273,32 +1245,33 @@ static int imx477_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 {
 	struct imx477 *imx477 = to_imx477(sd);
 	struct v4l2_mbus_framefmt *try_fmt_img =
-		v4l2_subdev_get_try_format(sd, fh->state, IMAGE_PAD);
-	struct v4l2_mbus_framefmt *try_fmt_meta =
-		v4l2_subdev_get_try_format(sd, fh->state, METADATA_PAD);
-	struct v4l2_rect *try_crop;
+		v4l2_subdev_get_try_format(sd, fh->pad, IMAGE_PAD);
+	//struct v4l2_mbus_framefmt *try_fmt_meta =
+	//	v4l2_subdev_get_try_format(sd, fh->pad, METADATA_PAD);
+	//struct v4l2_rect *try_crop;
+	printk(KERN_INFO "imx477: imx477_open\n");
 
 	mutex_lock(&imx477->mutex);
 
 	/* Initialize try_fmt for the image pad */
-	try_fmt_img->width = supported_modes_12bit[0].width;
-	try_fmt_img->height = supported_modes_12bit[0].height;
+	try_fmt_img->width = supported_modes[0].width;
+	try_fmt_img->height = supported_modes[0].height;
 	try_fmt_img->code = imx477_get_format_code(imx477,
 						   MEDIA_BUS_FMT_SRGGB12_1X12);
 	try_fmt_img->field = V4L2_FIELD_NONE;
 
 	/* Initialize try_fmt for the embedded metadata pad */
-	try_fmt_meta->width = IMX477_EMBEDDED_LINE_WIDTH;
+	/*try_fmt_meta->width = IMX477_EMBEDDED_LINE_WIDTH;
 	try_fmt_meta->height = IMX477_NUM_EMBEDDED_LINES;
 	try_fmt_meta->code = MEDIA_BUS_FMT_SENSOR_DATA;
-	try_fmt_meta->field = V4L2_FIELD_NONE;
+	try_fmt_meta->field = V4L2_FIELD_NONE;*/
 
 	/* Initialize try_crop */
-	try_crop = v4l2_subdev_get_try_crop(sd, fh->state, IMAGE_PAD);
+	/*try_crop = v4l2_subdev_get_try_crop(sd, fh->pad, IMAGE_PAD);
 	try_crop->left = IMX477_PIXEL_ARRAY_LEFT;
 	try_crop->top = IMX477_PIXEL_ARRAY_TOP;
 	try_crop->width = IMX477_PIXEL_ARRAY_WIDTH;
-	try_crop->height = IMX477_PIXEL_ARRAY_HEIGHT;
+	try_crop->height = IMX477_PIXEL_ARRAY_HEIGHT;*/
 
 	mutex_unlock(&imx477->mutex);
 
@@ -1321,6 +1294,7 @@ static void imx477_adjust_exposure_range(struct imx477 *imx477)
 static int imx477_set_frame_length(struct imx477 *imx477, unsigned int val)
 {
 	int ret = 0;
+	printk(KERN_INFO "imx477: imx477_set_frame_length\n");
 
 	imx477->long_exp_shift = 0;
 
@@ -1344,6 +1318,9 @@ static int imx477_set_ctrl(struct v4l2_ctrl *ctrl)
 		container_of(ctrl->handler, struct imx477, ctrl_handler);
 	struct i2c_client *client = v4l2_get_subdevdata(&imx477->sd);
 	int ret = 0;
+	u32 again = 0;
+	u32 dgain = 0;
+	printk(KERN_INFO "imx477: imx477_set_ctrl %d %s=%d\n", ctrl->id, ctrl->name, ctrl->val);
 
 	/*
 	 * The VBLANK control may change the limits of usable exposure, so check
@@ -1361,8 +1338,22 @@ static int imx477_set_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_ANALOGUE_GAIN:
-		ret = imx477_write_reg(imx477, IMX477_REG_ANALOG_GAIN,
-				       IMX477_REG_VALUE_16BIT, ctrl->val);
+		if (ctrl->val > IMX477_GAIN_MAX)
+			ctrl->val = IMX477_GAIN_MAX;
+		if (ctrl->val < IMX477_GAIN_STEP)
+			ctrl->val = IMX477_GAIN_STEP;
+
+		dgain = ctrl->val > IMX477_AGAIN_LIMIT ? (ctrl->val * 256 / 22 / 16) : 256;
+		again = ctrl->val > IMX477_AGAIN_LIMIT ? IMX477_AGAIN_LIMIT : ctrl->val;
+		again = 1024 - 1024 * 16 / again;
+
+		again = again > IMX477_ANA_GAIN_MAX ? IMX477_ANA_GAIN_MAX : again;
+		ret += imx477_write_reg(imx477, IMX477_REG_ANALOG_GAIN,
+				        IMX477_REG_VALUE_16BIT, again);
+		ret += imx477_write_reg(imx477, IMX477_REG_DIGITAL_GAIN,
+				        IMX477_REG_VALUE_16BIT, dgain);
+
+		printk(KERN_INFO "imx477: set again=%d dgain=%d\n", again, dgain);
 		break;
 	case V4L2_CID_EXPOSURE:
 		ret = imx477_write_reg(imx477, IMX477_REG_EXPOSURE,
@@ -1404,10 +1395,6 @@ static int imx477_set_ctrl(struct v4l2_ctrl *ctrl)
 		ret = imx477_set_frame_length(imx477,
 					      imx477->mode->height + ctrl->val);
 		break;
-	case V4L2_CID_HBLANK:
-		ret = imx477_write_reg(imx477, IMX477_REG_LINE_LENGTH, 2,
-				       imx477->mode->width + ctrl->val);
-		break;
 	default:
 		dev_info(&client->dev,
 			 "ctrl(id:0x%x,val:0x%x) is not handled\n",
@@ -1426,10 +1413,11 @@ static const struct v4l2_ctrl_ops imx477_ctrl_ops = {
 };
 
 static int imx477_enum_mbus_code(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_pad_config *cfg,
 				 struct v4l2_subdev_mbus_code_enum *code)
 {
 	struct imx477 *imx477 = to_imx477(sd);
+	printk(KERN_INFO "imx477: imx477_enum_mbus_code\n");
 
 	if (code->pad >= NUM_PADS)
 		return -EINVAL;
@@ -1451,42 +1439,36 @@ static int imx477_enum_mbus_code(struct v4l2_subdev *sd,
 }
 
 static int imx477_enum_frame_size(struct v4l2_subdev *sd,
-				  struct v4l2_subdev_state *sd_state,
+				  struct v4l2_subdev_pad_config *cfg,
 				  struct v4l2_subdev_frame_size_enum *fse)
 {
-	struct imx477 *imx477 = to_imx477(sd);
+	//struct imx477 *imx477 = to_imx477(sd);
+	printk(KERN_INFO "imx477: imx477_enum_frame_size\n");
 
-	if (fse->pad >= NUM_PADS)
+	if (fse->index >= ARRAY_SIZE(supported_modes))
 		return -EINVAL;
 
-	if (fse->pad == IMAGE_PAD) {
-		const struct imx477_mode *mode_list;
-		unsigned int num_modes;
+	fse->min_width  = supported_modes[fse->index].width;
+	fse->max_width  = supported_modes[fse->index].width;
+	fse->max_height = supported_modes[fse->index].height;
+	fse->min_height = supported_modes[fse->index].height;
+	return 0;
+}
 
-		get_mode_table(fse->code, &mode_list, &num_modes);
+static int imx477_g_frame_interval(struct v4l2_subdev *sd,
+				   struct v4l2_subdev_frame_interval *fi)
+{
+	struct imx477 *imx477 = to_imx477(sd);
+	const struct imx477_mode *mode = imx477->mode;
+       printk(KERN_INFO "imx477: imx477_g_frame_interval\n");
 
-		if (fse->index >= num_modes)
-			return -EINVAL;
-
-		if (fse->code != imx477_get_format_code(imx477, fse->code))
-			return -EINVAL;
-
-		fse->min_width = mode_list[fse->index].width;
-		fse->max_width = fse->min_width;
-		fse->min_height = mode_list[fse->index].height;
-		fse->max_height = fse->min_height;
-	} else {
-		if (fse->code != MEDIA_BUS_FMT_SENSOR_DATA || fse->index > 0)
-			return -EINVAL;
-
-		fse->min_width = IMX477_EMBEDDED_LINE_WIDTH;
-		fse->max_width = fse->min_width;
-		fse->min_height = IMX477_NUM_EMBEDDED_LINES;
-		fse->max_height = fse->min_height;
-	}
+	mutex_lock(&imx477->mutex);
+	fi->interval = mode->timeperframe_min;
+	mutex_unlock(&imx477->mutex);
 
 	return 0;
 }
+
 
 static void imx477_reset_colorspace(struct v4l2_mbus_framefmt *fmt)
 {
@@ -1502,25 +1484,28 @@ static void imx477_update_image_pad_format(struct imx477 *imx477,
 					   const struct imx477_mode *mode,
 					   struct v4l2_subdev_format *fmt)
 {
+	printk(KERN_INFO "imx477: imx477_update_image_pad_format\n");
 	fmt->format.width = mode->width;
 	fmt->format.height = mode->height;
 	fmt->format.field = V4L2_FIELD_NONE;
 	imx477_reset_colorspace(&fmt->format);
 }
 
-static void imx477_update_metadata_pad_format(struct v4l2_subdev_format *fmt)
+/*static void imx477_update_metadata_pad_format(struct v4l2_subdev_format *fmt)
 {
+	printk(KERN_INFO "imx477: dummy imx477_update_metadata_pad_format\n");
 	fmt->format.width = IMX477_EMBEDDED_LINE_WIDTH;
 	fmt->format.height = IMX477_NUM_EMBEDDED_LINES;
 	fmt->format.code = MEDIA_BUS_FMT_SENSOR_DATA;
 	fmt->format.field = V4L2_FIELD_NONE;
-}
+}*/
 
-static int imx477_get_pad_format(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *sd_state,
+static int imx477_get_fmt(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_pad_config *cfg,
 				 struct v4l2_subdev_format *fmt)
 {
 	struct imx477 *imx477 = to_imx477(sd);
+	printk(KERN_INFO "imx477: imx477_get_fmt pad=%d\n", fmt->pad);
 
 	if (fmt->pad >= NUM_PADS)
 		return -EINVAL;
@@ -1529,8 +1514,7 @@ static int imx477_get_pad_format(struct v4l2_subdev *sd,
 
 	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
 		struct v4l2_mbus_framefmt *try_fmt =
-			v4l2_subdev_get_try_format(&imx477->sd, sd_state,
-						   fmt->pad);
+			v4l2_subdev_get_try_format(&imx477->sd, cfg, fmt->pad);
 		/* update the code which could change due to vflip or hflip: */
 		try_fmt->code = fmt->pad == IMAGE_PAD ?
 				imx477_get_format_code(imx477, try_fmt->code) :
@@ -1543,7 +1527,7 @@ static int imx477_get_pad_format(struct v4l2_subdev *sd,
 			fmt->format.code =
 			       imx477_get_format_code(imx477, imx477->fmt_code);
 		} else {
-			imx477_update_metadata_pad_format(fmt);
+			//imx477_update_metadata_pad_format(fmt);
 		}
 	}
 
@@ -1569,8 +1553,9 @@ unsigned int imx477_get_frame_length(const struct imx477_mode *mode,
 
 static void imx477_set_framing_limits(struct imx477 *imx477)
 {
-	unsigned int frm_length_min, frm_length_default, hblank_min;
+	unsigned int frm_length_min, frm_length_default, hblank;
 	const struct imx477_mode *mode = imx477->mode;
+	printk(KERN_INFO "imx477: imx477_set_framing_limits\n");
 
 	frm_length_min = imx477_get_frame_length(mode, &mode->timeperframe_min);
 	frm_length_default =
@@ -1588,19 +1573,23 @@ static void imx477_set_framing_limits(struct imx477 *imx477)
 	/* Setting this will adjust the exposure limits as well. */
 	__v4l2_ctrl_s_ctrl(imx477->vblank, frm_length_default - mode->height);
 
-	hblank_min = mode->line_length_pix - mode->width;
-	__v4l2_ctrl_modify_range(imx477->hblank, hblank_min,
-				 IMX477_LINE_LENGTH_MAX, 1, hblank_min);
-	__v4l2_ctrl_s_ctrl(imx477->hblank, hblank_min);
+	/*
+	 * Currently PPL is fixed to the mode specified value, so hblank
+	 * depends on mode->width only, and is not changeable in any
+	 * way other than changing the mode.
+	 */
+	hblank = mode->line_length_pix - mode->width;
+	__v4l2_ctrl_modify_range(imx477->hblank, hblank, hblank, 1, hblank);
 }
 
-static int imx477_set_pad_format(struct v4l2_subdev *sd,
-				 struct v4l2_subdev_state *sd_state,
+static int imx477_set_fmt(struct v4l2_subdev *sd,
+				 struct v4l2_subdev_pad_config *cfg,
 				 struct v4l2_subdev_format *fmt)
 {
 	struct v4l2_mbus_framefmt *framefmt;
 	const struct imx477_mode *mode;
 	struct imx477 *imx477 = to_imx477(sd);
+	printk(KERN_INFO "imx477: imx477_set_fmt\n");
 
 	if (fmt->pad >= NUM_PADS)
 		return -EINVAL;
@@ -1624,22 +1613,22 @@ static int imx477_set_pad_format(struct v4l2_subdev *sd,
 					      fmt->format.height);
 		imx477_update_image_pad_format(imx477, mode, fmt);
 		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
+			framefmt = v4l2_subdev_get_try_format(sd, cfg,
 							      fmt->pad);
 			*framefmt = fmt->format;
-		} else if (imx477->mode != mode) {
+		} else {
 			imx477->mode = mode;
 			imx477->fmt_code = fmt->format.code;
 			imx477_set_framing_limits(imx477);
 		}
 	} else {
 		if (fmt->which == V4L2_SUBDEV_FORMAT_TRY) {
-			framefmt = v4l2_subdev_get_try_format(sd, sd_state,
+			framefmt = v4l2_subdev_get_try_format(sd, cfg,
 							      fmt->pad);
 			*framefmt = fmt->format;
 		} else {
 			/* Only one embedded data mode is supported */
-			imx477_update_metadata_pad_format(fmt);
+			//imx477_update_metadata_pad_format(fmt);
 		}
 	}
 
@@ -1648,57 +1637,413 @@ static int imx477_set_pad_format(struct v4l2_subdev *sd,
 	return 0;
 }
 
-static const struct v4l2_rect *
-__imx477_get_pad_crop(struct imx477 *imx477,
-		      struct v4l2_subdev_state *sd_state,
-		      unsigned int pad, enum v4l2_subdev_format_whence which)
-{
-	switch (which) {
-	case V4L2_SUBDEV_FORMAT_TRY:
-		return v4l2_subdev_get_try_crop(&imx477->sd, sd_state, pad);
-	case V4L2_SUBDEV_FORMAT_ACTIVE:
-		return &imx477->mode->crop;
-	}
 
-	return NULL;
-}
+#define CROP_START(SRC, DST) (((SRC) - (DST)) / 2 / 4 * 4)
+#define DST_WIDTH_4048 4048
 
 static int imx477_get_selection(struct v4l2_subdev *sd,
-				struct v4l2_subdev_state *sd_state,
+				struct v4l2_subdev_pad_config *cfg,
 				struct v4l2_subdev_selection *sel)
 {
-	switch (sel->target) {
-	case V4L2_SEL_TGT_CROP: {
-		struct imx477 *imx477 = to_imx477(sd);
+	struct imx477 *imx477 = to_imx477(sd);
 
-		mutex_lock(&imx477->mutex);
-		sel->r = *__imx477_get_pad_crop(imx477, sd_state, sel->pad,
-						sel->which);
-		mutex_unlock(&imx477->mutex);
+	printk(KERN_INFO "imx477: imx477_get_selection\n");
 
-		return 0;
-	}
-
-	case V4L2_SEL_TGT_NATIVE_SIZE:
-		sel->r.left = 0;
-		sel->r.top = 0;
-		sel->r.width = IMX477_NATIVE_WIDTH;
-		sel->r.height = IMX477_NATIVE_HEIGHT;
-
-		return 0;
-
-	case V4L2_SEL_TGT_CROP_DEFAULT:
-	case V4L2_SEL_TGT_CROP_BOUNDS:
-		sel->r.left = IMX477_PIXEL_ARRAY_LEFT;
-		sel->r.top = IMX477_PIXEL_ARRAY_TOP;
-		sel->r.width = IMX477_PIXEL_ARRAY_WIDTH;
-		sel->r.height = IMX477_PIXEL_ARRAY_HEIGHT;
-
+	if (sel->target == V4L2_SEL_TGT_CROP_BOUNDS) {
+		if (imx477->mode->width == 4056) {
+			sel->r.left = CROP_START(imx477->mode->width, DST_WIDTH_4048);
+			sel->r.width = DST_WIDTH_4048;
+			sel->r.top = CROP_START(imx477->mode->height, imx477->mode->height);
+			sel->r.height = imx477->mode->height;
+		} else {
+			sel->r.left = CROP_START(imx477->mode->width,
+							imx477->mode->width);
+			sel->r.width = imx477->mode->width;
+			sel->r.top = CROP_START(imx477->mode->height,
+							imx477->mode->height);
+			sel->r.height = imx477->mode->height;
+		}
 		return 0;
 	}
 
 	return -EINVAL;
 }
+
+static void imx477_get_module_inf(struct imx477 *imx477,
+				  struct rkmodule_inf *inf)
+{
+	printk(KERN_INFO "imx477: imx477_get_module_inf\n");
+
+	memset(inf, 0, sizeof(*inf));
+	strlcpy(inf->base.sensor, IMX477_NAME, sizeof(inf->base.sensor));
+	strlcpy(inf->base.module, "IMX477", sizeof(inf->base.module));
+	strlcpy(inf->base.lens, "Leica", sizeof(inf->base.lens));
+}
+
+
+static long imx477_ioctl(struct v4l2_subdev *sd, unsigned int cmd, void *arg)
+{
+	struct imx477 *imx477 = to_imx477(sd);
+	u32 stream;
+	long ret = 0;
+	struct rkmodule_hdr_cfg *hdr;
+	
+
+	printk(KERN_INFO "imx477: imx477_ioctl cmd=%d\n", cmd);
+
+	switch (cmd) {
+		case RKMODULE_GET_MODULE_INFO:
+			printk("RKMODULE_GET_MODULE_INFO\n");
+			break;
+
+		case RKMODULE_AWB_CFG:
+			printk("RKMODULE_AWB_CFG\n");
+			break;
+
+		case RKMODULE_AF_CFG:
+			printk("RKMODULE_AF_CFG\n");
+			break;
+
+		case RKMODULE_LSC_CFG:
+			printk("RKMODULE_LSC_CFG\n");
+			break;
+
+		case RKMODULE_GET_HDR_CFG:
+			printk("RKMODULE_GET_HDR_CFG\n");
+			break;
+
+		case RKMODULE_SET_HDR_CFG:
+			printk("RKMODULE_SET_HDR_CFG\n");
+			break;
+
+		case RKMODULE_SET_CONVERSION_GAIN:
+			printk("RKMODULE_SET_CONVERSION_GAIN\n");
+			break;
+
+		case RKMODULE_GET_LVDS_CFG:
+			printk("RKMODULE_GET_LVDS_CFG\n");
+			break;
+
+		case RKMODULE_SET_DPCC_CFG:
+			printk("RKMODULE_SET_DPCC_CFG\n");
+			break;
+
+		case RKMODULE_GET_NR_SWITCH_THRESHOLD:
+			printk("RKMODULE_GET_NR_SWITCH_THRESHOLD\n");
+			break;
+
+		case RKMODULE_SET_QUICK_STREAM:
+			printk("RKMODULE_SET_QUICK_STREAM\n");
+			break;
+
+		case RKMODULE_GET_BT656_INTF_TYPE:
+			printk("RKMODULE_GET_BT656_INTF_TYPE\n");
+			break;
+
+		case RKMODULE_GET_VC_FMT_INFO:
+			printk("RKMODULE_GET_VC_FMT_INFO\n");
+			break;
+
+		case RKMODULE_GET_VC_HOTPLUG_INFO:
+			printk("RKMODULE_GET_VC_HOTPLUG_INFO\n");
+			break;
+
+		case RKMODULE_GET_START_STREAM_SEQ:
+			printk("RKMODULE_GET_START_STREAM_SEQ\n");
+			break;
+
+		case RKMODULE_GET_VICAP_RST_INFO:
+			printk("RKMODULE_GET_VICAP_RST_INFO\n");
+			break;
+
+		case RKMODULE_SET_VICAP_RST_INFO:
+			printk("RKMODULE_SET_VICAP_RST_INFO\n");
+			break;
+
+		case RKMODULE_GET_DCG_RATIO:
+			printk("RKMODULE_GET_DCG_RATIO\n");
+			break;
+
+		case RKMODULE_GET_SONY_BRL:
+			printk("RKMODULE_GET_SONY_BRL\n");
+			break;
+
+		case RKMODULE_GET_CHANNEL_INFO:
+			printk("RKMODULE_GET_CHANNEL_INFO\n");
+			break;
+
+		case RKMODULE_GET_SYNC_MODE:
+			printk("RKMODULE_GET_SYNC_MODE\n");
+			break;
+
+		case RKMODULE_SET_SYNC_MODE:
+			printk("RKMODULE_SET_SYNC_MODE\n");
+			break;
+
+		case RKMODULE_SET_MCLK:
+			printk("RKMODULE_SET_MCLK\n");
+			break;
+
+		case RKMODULE_SET_LINK_FREQ:
+			printk("RKMODULE_SET_LINK_FREQ\n");
+			break;
+
+		case RKMODULE_SET_BUS_CONFIG:
+			printk("RKMODULE_SET_BUS_CONFIG\n");
+			break;
+
+		case RKMODULE_GET_BUS_CONFIG:
+			printk("RKMODULE_GET_BUS_CONFIG\n");
+			break;
+
+		case RKMODULE_SET_REGISTER:
+			printk("RKMODULE_SET_REGISTER\n");
+			break;
+
+		case RKMODULE_SYNC_I2CDEV:
+			printk("RKMODULE_SYNC_I2CDEV\n");
+			break;
+
+		case RKMODULE_SYNC_I2CDEV_COMPLETE:
+			printk("RKMODULE_SYNC_I2CDEV_COMPLETE\n");
+			break;
+
+		case RKMODULE_SET_DEV_INFO:
+			printk("RKMODULE_SET_DEV_INFO\n");
+			break;
+
+		case RKMODULE_SET_CSI_DPHY_PARAM:
+			printk("RKMODULE_SET_CSI_DPHY_PARAM\n");
+			break;
+
+		case RKMODULE_GET_CSI_DPHY_PARAM:
+			printk("RKMODULE_GET_CSI_DPHY_PARAM\n");
+			break;
+
+		case RKMODULE_GET_CSI_DSI_INFO:
+			printk("RKMODULE_GET_CSI_DSI_INFO\n");
+			break;
+
+		case RKMODULE_GET_HDMI_MODE:
+			printk("RKMODULE_GET_HDMI_MODE\n");
+			break;
+
+		case RKMODULE_SET_SENSOR_INFOS:
+			printk("RKMODULE_SET_SENSOR_INFOS\n");
+			break;
+
+		case RKMODULE_GET_READOUT_LINE_CNT_PER_LINE:
+			printk("RKMODULE_GET_READOUT_LINE_CNT_PER_LINE\n");
+			break;
+
+		case PREISP_CMD_SET_HDRAE_EXP:
+			printk("PREISP_CMD_SET_HDRAE_EXP\n");
+			break;
+
+		case PREISP_CMD_SAVE_HDRAE_PARAM:
+			printk("PREISP_CMD_SAVE_HDRAE_PARAM\n");
+			break;
+
+		case PREISP_DISP_SET_FRAME_OUTPUT:
+			printk("PREISP_DISP_SET_FRAME_OUTPUT\n");
+			break;
+
+		case PREISP_DISP_SET_FRAME_FORMAT:
+			printk("PREISP_DISP_SET_FRAME_FORMAT\n");
+			break;
+
+		case PREISP_DISP_SET_PRO_TIME:
+			printk("PREISP_DISP_SET_PRO_TIME\n");
+			break;
+
+		case PREISP_DISP_SET_PRO_CURRENT:
+			printk("PREISP_DISP_SET_PRO_CURRENT\n");
+			break;
+
+		case PREISP_DISP_SET_DENOISE:
+			printk("PREISP_DISP_SET_DENOISE\n");
+			break;
+
+		case PREISP_DISP_WRITE_EEPROM:
+			printk("PREISP_DISP_WRITE_EEPROM\n");
+			break;
+
+		case PREISP_DISP_READ_EEPROM:
+			printk("PREISP_DISP_READ_EEPROM\n");
+			break;
+
+		case PREISP_DISP_SET_LED_ON_OFF:
+			printk("PREISP_DISP_SET_LED_ON_OFF\n");
+			break;
+
+		default:
+			printk("UNKNOWN IOCTL CALL\n");
+			break;
+
+	}
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		imx477_get_module_inf(imx477, (struct rkmodule_inf *)arg);
+		break;
+	case RKMODULE_GET_HDR_CFG:
+		hdr = (struct rkmodule_hdr_cfg *)arg;
+		hdr->esp.mode = HDR_NORMAL_VC;
+		hdr->hdr_mode = NO_HDR;
+		break;
+	case RKMODULE_SET_QUICK_STREAM:
+
+		stream = *((u32 *)arg);
+		if (stream)
+			ret = imx477_write_reg(imx477, IMX477_REG_MODE_SELECT,
+				IMX477_REG_VALUE_08BIT, IMX477_MODE_STREAMING);
+		else
+			ret = imx477_write_reg(imx477, IMX477_REG_MODE_SELECT,
+				IMX477_REG_VALUE_08BIT, IMX477_MODE_STANDBY);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	printk(KERN_INFO "imx477: imx477_ioctl => %ld\n", ret);
+
+	return ret;
+}
+
+
+#ifdef CONFIG_COMPAT
+static long imx477_compat_ioctl32(struct v4l2_subdev *sd,
+				   unsigned int cmd, unsigned long arg)
+{
+	void __user *up = compat_ptr(arg);
+	struct rkmodule_inf *inf;
+	struct rkmodule_awb_cfg *cfg;
+	struct rkmodule_hdr_cfg *hdr;
+	struct preisp_hdrae_exp_s *hdrae;
+	struct rkmodule_lsc_cfg *lsc_cfg;
+	struct rkmodule_channel_info *ch_info;
+	long ret = 0;
+	u32 stream = 0;
+
+	switch (cmd) {
+	case RKMODULE_GET_MODULE_INFO:
+		inf = kzalloc(sizeof(*inf), GFP_KERNEL);
+		if (!inf) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = imx477_ioctl(sd, cmd, inf);
+		if (!ret) {
+			ret = copy_to_user(up, inf, sizeof(*inf));
+			if (ret)
+				ret = -EFAULT;
+		}
+		kfree(inf);
+		break;
+	case RKMODULE_AWB_CFG:
+		cfg = kzalloc(sizeof(*cfg), GFP_KERNEL);
+		if (!cfg) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = copy_from_user(cfg, up, sizeof(*cfg));
+		if (!ret)
+			ret = imx477_ioctl(sd, cmd, cfg);
+		else
+			ret = -EFAULT;
+		kfree(cfg);
+		break;
+	case RKMODULE_GET_HDR_CFG:
+		hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
+		if (!hdr) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = imx477_ioctl(sd, cmd, hdr);
+		if (!ret) {
+			if (copy_to_user(up, hdr, sizeof(*hdr))) {
+				kfree(hdr);
+				return -EFAULT;
+			}
+		}
+		kfree(hdr);
+		break;
+	case RKMODULE_SET_HDR_CFG:
+		hdr = kzalloc(sizeof(*hdr), GFP_KERNEL);
+		if (!hdr) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		if (copy_from_user(hdr, up, sizeof(*hdr))) {
+			kfree(hdr);
+			return -EFAULT;
+		}
+		ret = imx477_ioctl(sd, cmd, hdr);
+		kfree(hdr);
+		break;
+	case PREISP_CMD_SET_HDRAE_EXP:
+		hdrae = kzalloc(sizeof(*hdrae), GFP_KERNEL);
+		if (!hdrae) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		if (copy_from_user(hdrae, up, sizeof(*hdrae))) {
+			kfree(hdrae);
+			return -EFAULT;
+		}
+		ret = imx477_ioctl(sd, cmd, hdrae);
+		kfree(hdrae);
+		break;
+	case RKMODULE_LSC_CFG:
+		lsc_cfg = kzalloc(sizeof(*lsc_cfg), GFP_KERNEL);
+		if (!lsc_cfg) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = copy_from_user(lsc_cfg, up, sizeof(*lsc_cfg));
+		if (!ret)
+			ret = imx477_ioctl(sd, cmd, lsc_cfg);
+		else
+			ret = -EFAULT;
+		kfree(lsc_cfg);
+		break;
+	case RKMODULE_SET_QUICK_STREAM:
+		ret = copy_from_user(&stream, up, sizeof(u32));
+		if (!ret)
+			ret = imx477_ioctl(sd, cmd, &stream);
+		else
+			ret = -EFAULT;
+		break;
+	case RKMODULE_GET_CHANNEL_INFO:
+		ch_info = kzalloc(sizeof(*ch_info), GFP_KERNEL);
+		if (!ch_info) {
+			ret = -ENOMEM;
+			return ret;
+		}
+
+		ret = imx477_ioctl(sd, cmd, ch_info);
+		if (!ret) {
+			ret = copy_to_user(up, ch_info, sizeof(*ch_info));
+			if (ret)
+				ret = -EFAULT;
+		}
+		kfree(ch_info);
+		break;
+	default:
+		ret = -ENOIOCTLCMD;
+		break;
+	}
+
+	return ret;
+}
+#endif
 
 /* Start streaming */
 static int imx477_start_streaming(struct imx477 *imx477)
@@ -1707,6 +2052,8 @@ static int imx477_start_streaming(struct imx477 *imx477)
 	const struct imx477_reg_list *reg_list;
 	const struct imx477_reg_list *extra_regs;
 	int ret;
+
+	printk(KERN_INFO "imx477: imx477_start_streaming\n");
 
 	if (!imx477->common_regs_written) {
 		ret = imx477_write_regs(imx477, mode_common_regs,
@@ -1768,6 +2115,8 @@ static void imx477_stop_streaming(struct imx477 *imx477)
 	struct i2c_client *client = v4l2_get_subdevdata(&imx477->sd);
 	int ret;
 
+	printk(KERN_INFO "imx477: imx477_stop_streaming\n");
+
 	/* set stream off register */
 	ret = imx477_write_reg(imx477, IMX477_REG_MODE_SELECT,
 			       IMX477_REG_VALUE_08BIT, IMX477_MODE_STANDBY);
@@ -1775,11 +2124,13 @@ static void imx477_stop_streaming(struct imx477 *imx477)
 		dev_err(&client->dev, "%s failed to set stream\n", __func__);
 }
 
-static int imx477_set_stream(struct v4l2_subdev *sd, int enable)
+static int imx477_s_stream(struct v4l2_subdev *sd, int enable)
 {
 	struct imx477 *imx477 = to_imx477(sd);
 	struct i2c_client *client = v4l2_get_subdevdata(sd);
 	int ret = 0;
+
+	printk(KERN_INFO "imx477: imx477_s_stream, enable=%d\n", enable);
 
 	mutex_lock(&imx477->mutex);
 	if (imx477->streaming == enable) {
@@ -1832,6 +2183,8 @@ static int imx477_power_on(struct device *dev)
 	struct imx477 *imx477 = to_imx477(sd);
 	int ret;
 
+	printk(KERN_INFO "imx477: imx477_power_on");
+
 	ret = regulator_bulk_enable(IMX477_NUM_SUPPLIES,
 				    imx477->supplies);
 	if (ret) {
@@ -1847,7 +2200,8 @@ static int imx477_power_on(struct device *dev)
 		goto reg_off;
 	}
 
-	gpiod_set_value_cansleep(imx477->reset_gpio, 1);
+	gpiod_set_value_cansleep(imx477->power_gpio, 1);
+	gpiod_set_value_cansleep(imx477->gpo_gpio, 1);
 	usleep_range(IMX477_XCLR_MIN_DELAY_US,
 		     IMX477_XCLR_MIN_DELAY_US + IMX477_XCLR_DELAY_RANGE_US);
 
@@ -1863,8 +2217,11 @@ static int imx477_power_off(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx477 *imx477 = to_imx477(sd);
+	
+	printk(KERN_INFO "imx477: imx477_power_off");
 
-	gpiod_set_value_cansleep(imx477->reset_gpio, 0);
+	gpiod_set_value_cansleep(imx477->power_gpio, 1);
+	gpiod_set_value_cansleep(imx477->gpo_gpio, 0);
 	regulator_bulk_disable(IMX477_NUM_SUPPLIES, imx477->supplies);
 	clk_disable_unprepare(imx477->xclk);
 
@@ -1880,6 +2237,8 @@ static int __maybe_unused imx477_suspend(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx477 *imx477 = to_imx477(sd);
 
+	printk(KERN_INFO "imx477: imx477_suspend");
+
 	if (imx477->streaming)
 		imx477_stop_streaming(imx477);
 
@@ -1892,6 +2251,8 @@ static int __maybe_unused imx477_resume(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx477 *imx477 = to_imx477(sd);
 	int ret;
+
+	printk(KERN_INFO "imx477: imx477_resume");
 
 	if (imx477->streaming) {
 		ret = imx477_start_streaming(imx477);
@@ -1946,21 +2307,89 @@ static int imx477_identify_module(struct imx477 *imx477, u32 expected_id)
 	return 0;
 }
 
+
+static int imx477_s_power(struct v4l2_subdev *sd, int on)
+{
+	struct imx477 *imx477 = to_imx477(sd);
+	struct i2c_client *client = v4l2_get_subdevdata(&imx477->sd);
+	int ret = 0;
+
+	printk(KERN_INFO "imx477: imx477_s_power, target=%d\n", on);
+
+	mutex_lock(&imx477->mutex);
+
+	if (imx477->power_on == !!on)
+		goto unlock_and_return;
+
+	if (on) {
+		ret = pm_runtime_get_sync(&client->dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(&client->dev);
+			goto unlock_and_return;
+		}
+		imx477->power_on = true;
+	} else {
+		pm_runtime_put(&client->dev);
+		imx477->power_on = false;
+	}
+
+unlock_and_return:
+	mutex_unlock(&imx477->mutex);
+
+	return ret;
+}
+
+static int imx477_enum_frame_interval(struct v4l2_subdev *sd,
+				       struct v4l2_subdev_pad_config *cfg,
+				       struct v4l2_subdev_frame_interval_enum *fie)
+{
+	if (fie->index >= ARRAY_SIZE(supported_modes))
+		return -EINVAL;
+
+    fie->code = MEDIA_BUS_FMT_SRGGB12_1X12;
+	fie->width = supported_modes[fie->index].width;
+	fie->height = supported_modes[fie->index].height;
+	fie->interval = supported_modes[fie->index].timeperframe_min;
+	fie->reserved[0] = NO_HDR;
+
+	return 0;
+}
+
+static int imx477_g_mbus_config(struct v4l2_subdev *sd, unsigned int pad,
+				struct v4l2_mbus_config *config)
+{
+	config->type = V4L2_MBUS_CSI2_DPHY;
+	config->flags = V4L2_MBUS_CSI2_2_LANE |
+			V4L2_MBUS_CSI2_CHANNEL_0 |
+			V4L2_MBUS_CSI2_CONTINUOUS_CLOCK;
+
+	return 0;
+}
+
 static const struct v4l2_subdev_core_ops imx477_core_ops = {
 	.subscribe_event = v4l2_ctrl_subdev_subscribe_event,
 	.unsubscribe_event = v4l2_event_subdev_unsubscribe,
+
+	.s_power = imx477_s_power,
+	.ioctl = imx477_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl32 = imx477_compat_ioctl32,
+#endif
 };
 
 static const struct v4l2_subdev_video_ops imx477_video_ops = {
-	.s_stream = imx477_set_stream,
+	.s_stream = imx477_s_stream,
+	.g_frame_interval = imx477_g_frame_interval,
 };
 
 static const struct v4l2_subdev_pad_ops imx477_pad_ops = {
 	.enum_mbus_code = imx477_enum_mbus_code,
-	.get_fmt = imx477_get_pad_format,
-	.set_fmt = imx477_set_pad_format,
-	.get_selection = imx477_get_selection,
 	.enum_frame_size = imx477_enum_frame_size,
+	.enum_frame_interval = imx477_enum_frame_interval,
+	.get_fmt = imx477_get_fmt,
+	.set_fmt = imx477_set_fmt,
+	.get_selection = imx477_get_selection,
+	.get_mbus_config = imx477_g_mbus_config,
 };
 
 static const struct v4l2_subdev_ops imx477_subdev_ops = {
@@ -1971,6 +2400,10 @@ static const struct v4l2_subdev_ops imx477_subdev_ops = {
 
 static const struct v4l2_subdev_internal_ops imx477_internal_ops = {
 	.open = imx477_open,
+};
+
+static const s64 link_freq_menu_items[] = {
+	IMX477_DEFAULT_LINK_FREQ,
 };
 
 /* Initialize control handlers */
@@ -1990,6 +2423,12 @@ static int imx477_init_controls(struct imx477 *imx477)
 	mutex_init(&imx477->mutex);
 	ctrl_hdlr->lock = &imx477->mutex;
 
+	imx477->link_freq = v4l2_ctrl_new_int_menu(ctrl_hdlr, NULL,
+						V4L2_CID_LINK_FREQ,
+						ARRAY_SIZE(link_freq_menu_items) - 1, 0, 
+						link_freq_menu_items);
+	v4l2_ctrl_s_ctrl(imx477->link_freq, 0);
+
 	/* By default, PIXEL_RATE is read only */
 	imx477->pixel_rate = v4l2_ctrl_new_std(ctrl_hdlr, &imx477_ctrl_ops,
 					       V4L2_CID_PIXEL_RATE,
@@ -2006,6 +2445,10 @@ static int imx477_init_controls(struct imx477 *imx477)
 	imx477->hblank = v4l2_ctrl_new_std(ctrl_hdlr, &imx477_ctrl_ops,
 					   V4L2_CID_HBLANK, 0, 0xffff, 1, 0);
 
+	/* HBLANK is read-only for now, but does change with mode. */
+	if (imx477->hblank)
+		imx477->hblank->flags |= V4L2_CTRL_FLAG_READ_ONLY;
+
 	imx477->exposure = v4l2_ctrl_new_std(ctrl_hdlr, &imx477_ctrl_ops,
 					     V4L2_CID_EXPOSURE,
 					     IMX477_EXPOSURE_MIN,
@@ -2014,8 +2457,8 @@ static int imx477_init_controls(struct imx477 *imx477)
 					     IMX477_EXPOSURE_DEFAULT);
 
 	v4l2_ctrl_new_std(ctrl_hdlr, &imx477_ctrl_ops, V4L2_CID_ANALOGUE_GAIN,
-			  IMX477_ANA_GAIN_MIN, IMX477_ANA_GAIN_MAX,
-			  IMX477_ANA_GAIN_STEP, IMX477_ANA_GAIN_DEFAULT);
+			  IMX477_ANA_GAIN_MIN, IMX477_GAIN_MAX,
+			  IMX477_GAIN_STEP, IMX477_ANA_GAIN_DEFAULT);
 
 	v4l2_ctrl_new_std(ctrl_hdlr, &imx477_ctrl_ops, V4L2_CID_DIGITAL_GAIN,
 			  IMX477_DGTL_GAIN_MIN, IMX477_DGTL_GAIN_MAX,
@@ -2113,12 +2556,12 @@ static int imx477_check_hwcfg(struct device *dev)
 	}
 
 	/* Check the link frequency set in device tree */
-	if (!ep_cfg.nr_of_link_frequencies) {
+	if (false) {
 		dev_err(dev, "link-frequency property not found in DT\n");
 		goto error_out;
 	}
 
-	if (ep_cfg.nr_of_link_frequencies != 1 ||
+	if (false &&
 	    ep_cfg.link_frequencies[0] != IMX477_DEFAULT_LINK_FREQ) {
 		dev_err(dev, "Link frequency not supported: %lld\n",
 			ep_cfg.link_frequencies[0]);
@@ -2142,23 +2585,8 @@ static const struct imx477_compatible_data imx477_compatible = {
 	}
 };
 
-static const struct imx477_reg imx378_regs[] = {
-	{0x3e35, 0x01},
-	{0x4421, 0x08},
-	{0x3ff9, 0x00},
-};
-
-static const struct imx477_compatible_data imx378_compatible = {
-	.chip_id = IMX378_CHIP_ID,
-	.extra_regs = {
-		.num_of_regs = ARRAY_SIZE(imx378_regs),
-		.regs = imx378_regs
-	}
-};
-
 static const struct of_device_id imx477_dt_ids[] = {
 	{ .compatible = "sony,imx477", .data = &imx477_compatible },
-	{ .compatible = "sony,imx378", .data = &imx378_compatible },
 	{ /* sentinel */ }
 };
 
@@ -2186,9 +2614,9 @@ static int imx477_probe(struct i2c_client *client)
 		return -EINVAL;
 
 	/* Get system clock (xclk) */
-	imx477->xclk = devm_clk_get(dev, NULL);
+	imx477->xclk = devm_clk_get(dev, "xvclk");
 	if (IS_ERR(imx477->xclk)) {
-		dev_err(dev, "failed to get xclk\n");
+		dev_err(dev, "failed to get xvclk\n");
 		return PTR_ERR(imx477->xclk);
 	}
 
@@ -2206,9 +2634,11 @@ static int imx477_probe(struct i2c_client *client)
 	}
 
 	/* Request optional enable pin */
-	imx477->reset_gpio = devm_gpiod_get_optional(dev, "reset",
+	imx477->power_gpio = devm_gpiod_get_optional(dev, "reset",
 						     GPIOD_OUT_HIGH);
 
+	imx477->gpo_gpio = devm_gpiod_get_optional(dev, "pwdn",
+						     GPIOD_OUT_HIGH);
 	/*
 	 * The sensor must be powered for imx477_identify_module()
 	 * to be able to read the CHIP_ID register
@@ -2242,7 +2672,7 @@ static int imx477_probe(struct i2c_client *client)
 
 	/* Initialize source pads */
 	imx477->pad[IMAGE_PAD].flags = MEDIA_PAD_FL_SOURCE;
-	imx477->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
+	//imx477->pad[METADATA_PAD].flags = MEDIA_PAD_FL_SOURCE;
 
 	ret = media_entity_pads_init(&imx477->sd.entity, NUM_PADS, imx477->pad);
 	if (ret) {
@@ -2250,7 +2680,10 @@ static int imx477_probe(struct i2c_client *client)
 		goto error_handler_free;
 	}
 
-	ret = v4l2_async_register_subdev_sensor(&imx477->sd);
+	snprintf(imx477->sd.name, sizeof(imx477->sd.name), "m%02d_%s_%s %s",
+		0, "f", IMX477_NAME, dev_name(dev));
+
+	ret = v4l2_async_register_subdev_sensor_common(&imx477->sd);
 	if (ret < 0) {
 		dev_err(dev, "failed to register sensor sub-device: %d\n", ret);
 		goto error_media_entity;
@@ -2272,7 +2705,7 @@ error_power_off:
 	return ret;
 }
 
-static void imx477_remove(struct i2c_client *client)
+static int imx477_remove(struct i2c_client *client)
 {
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct imx477 *imx477 = to_imx477(sd);
@@ -2285,13 +2718,15 @@ static void imx477_remove(struct i2c_client *client)
 	if (!pm_runtime_status_suspended(&client->dev))
 		imx477_power_off(&client->dev);
 	pm_runtime_set_suspended(&client->dev);
+
+	return 0;
 }
 
 MODULE_DEVICE_TABLE(of, imx477_dt_ids);
 
 static const struct dev_pm_ops imx477_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(imx477_suspend, imx477_resume)
-	SET_RUNTIME_PM_OPS(imx477_power_off, imx477_power_on, NULL)
+	//SET_SYSTEM_SLEEP_PM_OPS(imx477_suspend, imx477_resume)
+	//SET_RUNTIME_PM_OPS(imx477_power_off, imx477_power_on, NULL)
 };
 
 static struct i2c_driver imx477_i2c_driver = {
